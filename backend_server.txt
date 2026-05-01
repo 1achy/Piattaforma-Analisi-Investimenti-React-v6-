@@ -1,0 +1,125 @@
+# File: backend_server.py
+# Descrizione: Server Flask v7 che aggiunge un set completo di metriche finanziarie.
+
+from flask import Flask, jsonify
+from flask_cors import CORS
+import yfinance as yf
+import pandas as pd
+from datetime import timedelta
+import requests_cache
+from yfinance.exceptions import YFRateLimitError
+
+# 1. Inizializzazione dell'applicazione Flask
+app = Flask(__name__)
+
+# 2. Abilitazione del CORS
+CORS(app)
+
+# 3. Setup della Cache Persistente
+session = requests_cache.CachedSession(
+    'yfinance_cache',
+    expire_after=timedelta(minutes=15), # Cache expires after 15 minutes
+    backend='sqlite'      # Use SQLite as a backend
+)
+
+# --- Funzione Helper per pulire i dati ---
+def clean_value(value):
+    """Converte i valori numpy in tipi nativi Python e gestisce i NaN."""
+    if pd.isna(value):
+        return None
+    if hasattr(value, 'item'): # For numpy scalar types
+        return value.item()
+    return value
+
+# 4. Definizione dell'endpoint API
+@app.route("/api/stockdata/<string:ticker_symbol>", methods=['GET'])
+def get_stock_data(ticker_symbol):
+    """
+    Recupera, elabora e restituisce i dati finanziari per un dato ticker, 
+    utilizzando una sessione con cache persistente.
+    """
+    print(f"Richiesta ricevuta per {ticker_symbol}.")
+    try:
+        # --- Fase 1: Raccolta Dati usando la sessione cachata ---
+        stock = yf.Ticker(ticker_symbol, session=session)
+        info = stock.info
+
+        # Check if essential info is present
+        if not info or (info.get('regularMarketPrice') is None and info.get('currentPrice') is None):
+            return jsonify({"error": f"Dati non trovati o insufficienti per '{ticker_symbol}'. Verifica che il ticker sia corretto."}), 404
+
+        financials = stock.financials
+        balance_sheet = stock.balance_sheet
+        
+        # --- Fase 2: Estrazione e Pulizia dei Dati ---
+        net_income_series = financials.loc['Net Income'] if not financials.empty and 'Net Income' in financials.index else pd.Series([0])
+        net_income = net_income_series.iloc[0] if not net_income_series.empty else 0
+        
+        normalized_income_series = financials.loc['Normalized Income'] if not financials.empty and 'Normalized Income' in financials.index else pd.Series([net_income])
+        normalized_income = normalized_income_series.iloc[0] if not normalized_income_series.empty else net_income
+        
+        shares_outstanding = info.get("sharesOutstanding")
+        normalized_eps = (normalized_income / shares_outstanding) if shares_outstanding and shares_outstanding != 0 else None
+
+        # Estrazione dei dati storici
+        historical_revenue = {ts.strftime('%Y-%m-%d'): clean_value(val) for ts, val in (financials.loc['Total Revenue'].to_dict() if not financials.empty and 'Total Revenue' in financials.index else {}).items()}
+        historical_net_income = {ts.strftime('%Y-%m-%d'): clean_value(val) for ts, val in (financials.loc['Net Income'].to_dict() if not financials.empty and 'Net Income' in financials.index else {}).items()}
+        historical_debt = {ts.strftime('%Y-%m-%d'): clean_value(val) for ts, val in (balance_sheet.loc['Total Debt'].to_dict() if not balance_sheet.empty and 'Total Debt' in balance_sheet.index else {}).items()}
+        
+        data = {
+            "ticker": ticker_symbol,
+            "companyName": info.get("longName"),
+            "shortName": info.get("shortName"),
+            "sector": info.get("sector"),
+            "currentPrice": clean_value(info.get("currentPrice") or info.get("regularMarketPrice")),
+            
+            # Metriche di qualità e rischio
+            "roe": clean_value(info.get("returnOnEquity") * 100) if info.get("returnOnEquity") is not None else None, 
+            "payoutRatio": clean_value(info.get("payoutRatio") * 100) if info.get("payoutRatio") is not None else None,
+            "beta": clean_value(info.get("beta")),
+            "debtToEquity": clean_value(info.get("debtToEquity")),
+            "currentRatio": clean_value(info.get("currentRatio")), # NUOVO
+
+            # Metriche di valutazione
+            "trailingPE": clean_value(info.get("trailingPE")),
+            "forwardPE": clean_value(info.get("forwardPE")),
+            "pegRatio": clean_value(info.get("pegRatio")),
+            "priceToBook": clean_value(info.get("priceToBook")),
+            "normalizedEPS": clean_value(normalized_eps),
+            "enterpriseToEbitda": clean_value(info.get("enterpriseToEbitda")), # NUOVO
+            "dividendYield": clean_value(info.get("dividendYield") * 100) if info.get("dividendYield") is not None else None, # NUOVO
+
+            # NUOVO: Metriche di Efficienza e Operatività
+            "netProfitMargin": clean_value(info.get("profitMargins") * 100) if info.get("profitMargins") is not None else None,
+            "grossMargin": clean_value(info.get("grossMargins") * 100) if info.get("grossMargins") is not None else None,
+            "revenueGrowth": clean_value(info.get("revenueGrowth") * 100) if info.get("revenueGrowth") is not None else None,
+            "earningsGrowth": clean_value(info.get("earningsGrowth") * 100) if info.get("earningsGrowth") is not None else None,
+            "inventoryTurnover": clean_value(info.get("inventoryTurnover")),
+            "assetTurnover": clean_value(info.get("assetTurnover")),
+            
+            # Consenso degli analisti
+            "analystConsensus": {
+                "rating": info.get("recommendationKey"),
+                "targetPrice": clean_value(info.get("targetMeanPrice"))
+            },
+
+            # Dati storici per i grafici
+            "historicalData": {
+                "revenue": historical_revenue,
+                "netIncome": historical_net_income,
+                "totalDebt": historical_debt
+            }
+        }
+
+        return jsonify(data)
+
+    except YFRateLimitError as e:
+        return jsonify({"error": f"Yahoo Finance ha limitato le richieste. La cache è stata appena creata, attendi qualche minuto prima di riprovare. ({str(e)})"}), 429
+    
+    except Exception as e:
+        print(f"Errore interno del server per {ticker_symbol}: {str(e)}")
+        return jsonify({"error": f"Si è verificato un errore interno del server durante l'elaborazione di {ticker_symbol}."}), 500
+
+# 5. Avvio del server
+if __name__ == "__main__":
+    app.run(debug=True, port=5000)

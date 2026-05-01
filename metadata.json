@@ -1,0 +1,6 @@
+{
+  "name": "Analista Valore AI (React Edition)",
+  "description": "Un'applicazione web React per l'analisi del valore delle azioni utilizzando l'API Gemini, ispirata all'edizione Yahoo Finance.",
+  "requestFramePermissions": [],
+  "prompt": ""
+}
